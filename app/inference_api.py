@@ -4,6 +4,7 @@ import os
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pyspark.ml import PipelineModel
@@ -31,6 +32,11 @@ app = FastAPI(title="KKBox Churn Inference API", version="1.0.0",
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ["*"], allow_methods=["*"],
                    allow_headers=["*"], allow_credentials=False)
+
+
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse("/app/ui/index.html")
 
 try:
     from kafka import KafkaProducer

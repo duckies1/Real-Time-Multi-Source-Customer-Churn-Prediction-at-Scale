@@ -194,6 +194,9 @@ Compose includes an `inference-api` service for a UI to call directly. It loads 
 100 MiB slice's Spark ML model and feature rows from HDFS, scores requests with Spark,
 and publishes each result to Kafka topic `churn-ui-predictions`. The API is exposed on
 port 8000 with interactive docs at `http://localhost:8000/docs`.
+The interactive dashboard is served at `http://localhost:8000/`; it provides a
+customer picker, live what-if sliders, batch simulation chart, and recent scored
+customers. Slider changes automatically rescore the edited profile.
 
 The sample must have been prepared and trained first (steps 1–2 in the 100 MiB run
 above). Start or rebuild the API service after that training completes:
