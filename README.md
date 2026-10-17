@@ -59,13 +59,15 @@ Create the HDFS output directories, then run the Spark batch job:
 
 ```bash
 docker compose exec namenode hdfs dfs -mkdir -p /churn/features /churn/models /churn/predictions /churn/checkpoints
-docker compose exec spark /opt/spark/bin/spark-submit \
-  --master 'local[*]' \
+docker compose exec -e SPARK_SQL_SHUFFLE_PARTITIONS=32 spark \
+  /opt/spark/bin/spark-submit --driver-memory 3g \
+  --master 'local[4]' \
   --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+  --conf spark.sql.files.maxPartitionBytes=33554432 \
   /app/build_train.py
 ```
 
-Successful completion prints a deterministic holdout `areaUnderROC` and saves the fitted pipeline model at `hdfs://namenode:9000/churn/models/churn-rf`. Feature rows are saved under `/churn/features/train`. The same features are exported into the host-mounted `artifacts/scoring-events/` folder for replay. The training step scans the listening history and can take several minutes.
+These full-data settings give the driver a 3 GiB heap and limit Spark to four local worker threads with 32 MiB CSV splits. The default 1 GiB heap can run out of memory during full listening-history aggregation. Successful completion prints feature materialization time, holdout `areaUnderROC`, and model fit/evaluation time, then saves the fitted pipeline model at `hdfs://namenode:9000/churn/models/churn-rf`. Feature rows are saved under `/churn/features/train`. The same features are exported into the host-mounted `artifacts/scoring-events/` folder for replay.
 
 For the downloaded original files, set paths for the Spark submit invocation:
 
@@ -170,6 +172,8 @@ This workflow uses a stable MD5 hash bucket of `msno` across the label, member, 
 
 The 100 MiB target produced 106,591,706 bytes (101.65 MiB) across the four local slice files, with 50,454 joined labeled users. In the Spark container (`local[*]`), the current tuned run reported 4.21 seconds for feature materialization, 7.93 seconds for model fit plus holdout evaluation, and ROC AUC 0.98163. I then replayed 5,000 events at a configured 500 events/second; Kafka reported 5,000 feature and 5,000 prediction offsets, and Spark SQL counted 5,000 Parquet predictions in HDFS. This is a small-sample functional/performance check, not a reliable model quality estimate or a distributed cluster benchmark.
 
+The full v2 dataset also ran successfully in this workspace with the full-data settings above. It produced 970,960 joined feature rows; feature materialization took 27.93 seconds, model fit plus evaluation took 43.54 seconds, and the seeded holdout ROC AUC was 0.97779. Wall time was about 82 seconds. The initial default-heap attempt failed with `Java heap space`, which is why the documented full-data command allocates 3 GiB and uses four local workers.
+
 ### Optional: one-target smoke run
 
 This fast-path check takes one churn user as its scoring target and one non-churn control so the binary classifier sees both classes. It builds features from all three source tables, fits a tiny Spark ML random forest, scores the single target, and writes the result to `/churn/smoke-one` without touching the full model or feature outputs:
@@ -181,6 +185,53 @@ docker compose exec spark /opt/spark/bin/spark-submit \
   /app/smoke_one.py
 docker compose exec namenode hdfs dfs -ls /churn/smoke-one
 ```
+
+### 3. Start the streaming scorer
+
+### UI integration: REST inference on the 100 MiB sample
+
+Compose includes an `inference-api` service for a UI to call directly. It loads the
+100 MiB slice's Spark ML model and feature rows from HDFS, scores requests with Spark,
+and publishes each result to Kafka topic `churn-ui-predictions`. The API is exposed on
+port 8000 with interactive docs at `http://localhost:8000/docs`.
+
+The sample must have been prepared and trained first (steps 1–2 in the 100 MiB run
+above). Start or rebuild the API service after that training completes:
+
+```bash
+docker compose up -d --build inference-api
+curl http://localhost:8000/health
+curl 'http://localhost:8000/api/v1/sample-users?limit=3'
+```
+
+`sample-users` returns usable feature values and `actual_label` for demo comparison.
+Do not send `actual_label` back as a model feature. Score a sample user by its `msno`:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"msno":"PASTE_A_SAMPLE_MSNO_HERE"}'
+```
+
+Or ask the API to score a deterministic batch from the sample for a UI simulation:
+
+```bash
+curl -X POST 'http://localhost:8000/api/v1/simulate?limit=20'
+```
+
+The JSON response contains the predicted class, churn probability, and (for the
+simulation endpoint) actual labels and batch accuracy. Each prediction is also sent
+to Kafka topic `churn-ui-predictions`. From a Kafka container, inspect recent events:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:29092 --topic churn-ui-predictions --from-beginning
+```
+
+For browser-based UI development, call `http://localhost:8000` from the UI and use the
+`/docs` page as the request/response reference. CORS is open for local demo convenience;
+set `CORS_ORIGINS` in `compose.yaml` to the UI origin before exposing this demo elsewhere.
+Rebuild/restart the API after replacing the slice model: `docker compose up -d --build inference-api`.
 
 ### 3. Start the streaming scorer
 

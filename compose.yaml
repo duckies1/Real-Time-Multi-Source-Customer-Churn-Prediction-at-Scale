@@ -51,6 +51,25 @@ services:
       - ./artifacts:/artifacts
     networks: [churn]
     entrypoint: ["/bin/bash", "-lc", "tail -f /dev/null"]
+  inference-api:
+    build: ./spark
+    container_name: churn-inference-api
+    user: root
+    depends_on: [namenode, kafka]
+    volumes:
+      - ./app:/app:ro
+    environment:
+      SPARK_HOME: /opt/spark
+      PYTHONPATH: /opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip
+      SPARK_MASTER: local[2]
+      MODEL_PATH: hdfs://namenode:9000/churn/slice-100mb/models/churn-rf
+      FEATURES_PATH: hdfs://namenode:9000/churn/slice-100mb/features/train
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_PREDICTIONS_TOPIC: churn-ui-predictions
+      CORS_ORIGINS: "*"
+    ports: ["8000:8000"]
+    networks: [churn]
+    command: ["/bin/bash", "-lc", "cd /app && python3 -m uvicorn inference_api:app --host 0.0.0.0 --port 8000"]
 volumes:
   hdfs_namenode:
   hdfs_datanode:
