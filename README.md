@@ -41,7 +41,7 @@ The default v2 files use a nested `data/churn_comp_refresh` path. If your copy i
 
 ## Run the pipeline
 
-Run commands from the repository root. The first startup downloads the Docker images. The Spark image installs NumPy for Spark ML. Spark's Kafka connector is resolved by `/opt/spark/bin/spark-submit --packages` at job launch, so allow network access from Docker for Maven dependencies.
+Run commands from the repository root. The first startup downloads the Docker images. The Spark image installs NumPy for Spark ML and `kafka-python` for the replay producer. Spark's Kafka connector is resolved by `/opt/spark/bin/spark-submit --packages` at job launch, so allow network access from Docker for Maven dependencies.
 
 ### 1. Start HDFS, Kafka, and the Spark runtime
 
@@ -77,6 +77,98 @@ docker compose exec -e TRAIN_FILE=/dataset/download/train.csv \
   spark /opt/spark/bin/spark-submit --master 'local[*]' \
   --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 /app/build_train.py
 ```
+
+### 100 MiB HDFS slice benchmark
+
+This workflow uses a stable MD5 hash bucket of `msno` across the label, member, transaction, and log tables, preserving a consistent customer cohort across sources. The preparer estimates a sampling fraction from total source bytes and writes about 100 MiB to the shared `artifacts/` folder. It must scan the source CSVs to select matching users (about 2 GB for the included v2 tables); Spark then reads the prepared subset from HDFS.
+
+1. Prepare the sample and inspect the actual size:
+
+   ```bash
+   docker compose exec spark python3 /app/prepare_100mb_slice.py --target-mib 100
+   du -sh artifacts/kkbox-100mb
+   ```
+
+2. Upload the four sampled CSVs to HDFS:
+
+   ```bash
+   docker compose exec namenode hdfs dfs -mkdir -p /churn/input/kkbox-100mb
+   docker compose exec namenode hdfs dfs -put -f /artifacts/kkbox-100mb/train.csv /churn/input/kkbox-100mb/
+   docker compose exec namenode hdfs dfs -put -f /artifacts/kkbox-100mb/transactions.csv /churn/input/kkbox-100mb/
+   docker compose exec namenode hdfs dfs -put -f /artifacts/kkbox-100mb/user_logs.csv /churn/input/kkbox-100mb/
+   docker compose exec namenode hdfs dfs -put -f /artifacts/kkbox-100mb/members.csv /churn/input/kkbox-100mb/
+   docker compose exec namenode hdfs dfs -du -h /churn/input/kkbox-100mb
+   ```
+
+   The first size in `hdfs dfs -du -h` is logical file size. The second includes HDFS's configured replication factor (3 by default), so it can be about three times larger in this single-DataNode demo.
+
+3. Train on the HDFS slice. Outputs go under `/churn/slice-100mb`, leaving the default `/churn` artifacts untouched:
+
+   ```bash
+   docker compose exec \
+     -e TRAIN_FILE=hdfs://namenode:9000/churn/input/kkbox-100mb/train.csv \
+     -e TRANSACTIONS_FILE=hdfs://namenode:9000/churn/input/kkbox-100mb/transactions.csv \
+     -e LOGS_FILE=hdfs://namenode:9000/churn/input/kkbox-100mb/user_logs.csv \
+     -e MEMBERS_FILE=hdfs://namenode:9000/churn/input/kkbox-100mb/members.csv \
+     -e OUTPUT_BASE=hdfs://namenode:9000/churn/slice-100mb \
+     -e SCORING_EXPORT_DIR=file:///artifacts/scoring-events-100mb \
+     spark /opt/spark/bin/spark-submit --master 'local[*]' \
+     --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+     /app/build_train.py
+   ```
+
+   The job prints feature materialization time, holdout ROC AUC, and model fit/evaluation time.
+
+4. In a second terminal, create slice-specific Kafka topics and start the streaming scorer. Keep this command running:
+
+   ```bash
+   docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic churn-features-100mb --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1
+   docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic churn-predictions-100mb --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1
+   docker compose exec \
+     -e MODEL_PATH=hdfs://namenode:9000/churn/slice-100mb/models/churn-rf \
+     -e PREDICTIONS_PATH=hdfs://namenode:9000/churn/slice-100mb/predictions \
+     -e CHECKPOINT_PATH=hdfs://namenode:9000/churn/slice-100mb/checkpoints/score \
+     -e FEATURES_TOPIC=churn-features-100mb \
+     -e PREDICTIONS_TOPIC=churn-predictions-100mb \
+     spark /opt/spark/bin/spark-submit --master 'local[*]' \
+     --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+     --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
+     /app/stream_score.py
+   ```
+
+5. In a third terminal, replay a bounded set of sample users through Kafka. Use `--limit 5000` for the measured smoke run or omit `--limit` to send every feature row:
+
+   ```bash
+   docker compose exec \
+     -e KAFKA_BOOTSTRAP_SERVERS=kafka:29092 \
+     -e KAFKA_TOPIC=churn-features-100mb \
+     spark python3 /app/produce_events.py \
+     --input /artifacts/scoring-events-100mb --rate 500 --limit 5000
+   ```
+
+6. Verify scored row count and Kafka topic offsets:
+
+   ```bash
+   docker compose exec spark /opt/spark/bin/spark-sql \
+     --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+     -e 'SELECT COUNT(*) AS scored_rows FROM parquet.`hdfs://namenode:9000/churn/slice-100mb/predictions`'
+   docker compose exec kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic churn-features-100mb
+   docker compose exec kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic churn-predictions-100mb
+   ```
+
+   Stop the streaming scorer with Ctrl+C in its terminal after the bounded replay has been processed.
+
+   To start a fresh repeat, stop the stream and remove the slice checkpoint and prediction folder. Delete and recreate both slice Kafka topics too, or the new checkpoint will replay previously retained feature events:
+
+   ```bash
+   docker compose exec namenode hdfs dfs -rm -r -f /churn/slice-100mb/checkpoints/score /churn/slice-100mb/predictions
+   docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --delete --topic churn-features-100mb --bootstrap-server kafka:29092
+   docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --delete --topic churn-predictions-100mb --bootstrap-server kafka:29092
+   ```
+
+#### Measured run in this workspace
+
+The 100 MiB target produced 106,591,706 bytes (101.65 MiB) across the four local slice files, with 50,454 joined labeled users. In the Spark container (`local[*]`), the current tuned run reported 4.21 seconds for feature materialization, 7.93 seconds for model fit plus holdout evaluation, and ROC AUC 0.98163. I then replayed 5,000 events at a configured 500 events/second; Kafka reported 5,000 feature and 5,000 prediction offsets, and Spark SQL counted 5,000 Parquet predictions in HDFS. This is a small-sample functional/performance check, not a reliable model quality estimate or a distributed cluster benchmark.
 
 ### Optional: one-target smoke run
 
