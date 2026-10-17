@@ -90,9 +90,9 @@ def sample_users(limit: int = Query(10, ge=1, le=100)):
 
 @app.post("/api/v1/predict")
 def predict(request: PredictRequest):
-    if bool(request.msno) == bool(request.features):
-        raise HTTPException(422, "Provide exactly one of 'msno' or 'features'.")
-    if request.msno:
+    if request.features is None:
+        if not request.msno:
+            raise HTTPException(422, "Provide 'msno' or a complete 'features' object.")
         found = features.filter(features.msno == request.msno).limit(1).collect()
         if not found:
             raise HTTPException(404, "msno not found in the 100 MiB demo feature set")
