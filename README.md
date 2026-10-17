@@ -41,7 +41,7 @@ The default v2 files use a nested `data/churn_comp_refresh` path. If your copy i
 
 ## Run the pipeline
 
-Run commands from the repository root. The first startup downloads the Docker images. Spark's Kafka connector is resolved by `spark-submit --packages` at job launch, so allow network access from Docker for Maven dependencies.
+Run commands from the repository root. The first startup downloads the Docker images. The Spark image installs NumPy for Spark ML. Spark's Kafka connector is resolved by `/opt/spark/bin/spark-submit --packages` at job launch, so allow network access from Docker for Maven dependencies.
 
 ### 1. Start HDFS, Kafka, and the Spark runtime
 
@@ -59,7 +59,7 @@ Create the HDFS output directories, then run the Spark batch job:
 
 ```bash
 docker compose exec namenode hdfs dfs -mkdir -p /churn/features /churn/models /churn/predictions /churn/checkpoints
-docker compose exec spark spark-submit \
+docker compose exec spark /opt/spark/bin/spark-submit \
   --master 'local[*]' \
   --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
   /app/build_train.py
@@ -67,15 +67,27 @@ docker compose exec spark spark-submit \
 
 Successful completion prints a deterministic holdout `areaUnderROC` and saves the fitted pipeline model at `hdfs://namenode:9000/churn/models/churn-rf`. Feature rows are saved under `/churn/features/train`. The same features are exported into the host-mounted `artifacts/scoring-events/` folder for replay. The training step scans the listening history and can take several minutes.
 
-For the downloaded original files, set paths for the `spark-submit` invocation:
+For the downloaded original files, set paths for the Spark submit invocation:
 
 ```bash
 docker compose exec -e TRAIN_FILE=/dataset/download/train.csv \
   -e TRANSACTIONS_FILE=/dataset/download/transactions.csv \
   -e LOGS_FILE=/dataset/download/user_logs.csv \
   -e MEMBERS_FILE=/dataset/download/members_v3.csv \
-  spark spark-submit --master 'local[*]' \
+  spark /opt/spark/bin/spark-submit --master 'local[*]' \
   --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 /app/build_train.py
+```
+
+### Optional: one-target smoke run
+
+This fast-path check takes one churn user as its scoring target and one non-churn control so the binary classifier sees both classes. It builds features from all three source tables, fits a tiny Spark ML random forest, scores the single target, and writes the result to `/churn/smoke-one` without touching the full model or feature outputs:
+
+```bash
+docker compose exec spark /opt/spark/bin/spark-submit \
+  --master 'local[*]' \
+  --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+  /app/smoke_one.py
+docker compose exec namenode hdfs dfs -ls /churn/smoke-one
 ```
 
 ### 3. Start the streaming scorer
@@ -83,7 +95,7 @@ docker compose exec -e TRAIN_FILE=/dataset/download/train.csv \
 In a second terminal, start a long-running Structured Streaming job. The Spark connector is version-matched to Spark 3.5.1 / Scala 2.12:
 
 ```bash
-docker compose exec spark spark-submit \
+docker compose exec spark /opt/spark/bin/spark-submit \
   --master 'local[*]' \
   --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
@@ -122,7 +134,7 @@ docker compose exec namenode hdfs dfs -ls -R /churn
 Read the Parquet output with Spark (the predictions are not plain text):
 
 ```bash
-docker compose exec spark spark-sql \
+docker compose exec spark /opt/spark/bin/spark-sql \
   -e "SELECT msno, prediction, probability FROM parquet.`hdfs://namenode:9000/churn/predictions` LIMIT 20"
 ```
 
