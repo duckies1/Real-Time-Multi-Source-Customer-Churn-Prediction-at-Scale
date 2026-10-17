@@ -1,5 +1,6 @@
 """Build user-level features from KKBox's three source tables and train Spark ML."""
 import os
+from time import perf_counter
 from pyspark.sql import SparkSession, functions as F
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import Imputer, VectorAssembler, StandardScaler
@@ -12,10 +13,12 @@ TX = os.environ.get("TRANSACTIONS_FILE", f"{BASE}/transactions_v2.csv/data/churn
 LOG = os.environ.get("LOGS_FILE", f"{BASE}/user_logs_v2.csv/data/churn_comp_refresh/user_logs_v2.csv")
 MEM = os.environ.get("MEMBERS_FILE", f"{BASE}/members_v3.csv")
 def local_file(path):
-    return path if path.startswith("file:") else f"file://{path}"
-OUT = "hdfs://namenode:9000/churn"
+    return path if "://" in path else f"file://{path}"
+OUT = os.environ.get("OUTPUT_BASE", "hdfs://namenode:9000/churn")
 
-spark = SparkSession.builder.appName("kkbox-churn-feature-train").getOrCreate()
+spark = (SparkSession.builder.appName("kkbox-churn-feature-train")
+         .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SQL_SHUFFLE_PARTITIONS", "8"))
+         .getOrCreate())
 spark.sparkContext.setLogLevel("WARN")
 labels = spark.read.option("header", True).csv(local_file(TRAIN)).select("msno", F.col("is_churn").cast("double").alias("label")).dropDuplicates(["msno"])
 members = spark.read.option("header", True).csv(local_file(MEM)).select("msno", F.col("city").cast("double"), F.col("bd").cast("double").alias("age"), F.col("registered_via").cast("double"))
@@ -34,17 +37,22 @@ log_features = logs.groupBy("msno").agg(
     F.sum(F.col("num_100").cast("double")).alias("plays_100"), F.sum(F.col("num_unq").cast("double")).alias("unique_songs"))
 features = labels.join(members, "msno", "left").join(tx_features, "msno", "left").join(log_features, "msno", "left")
 numeric = ["city", "age", "registered_via", "tx_count", "avg_paid", "avg_plan_days", "auto_renew_rate", "ever_cancelled", "last_transaction_date", "log_days", "total_secs", "plays_25", "plays_50", "plays_75", "plays_985", "plays_100", "unique_songs"]
-features = features.select("msno", "label", *numeric).fillna(0, subset=numeric)
-features.write.mode("overwrite").parquet(f"{OUT}/features/train")
+features = features.select("msno", "label", *numeric).fillna(0, subset=numeric).cache()
+feature_started = perf_counter()
+feature_rows = features.count()
+print(f"Feature rows={feature_rows}; materialization_seconds={perf_counter() - feature_started:.2f}")
+features.coalesce(4).write.mode("overwrite").parquet(f"{OUT}/features/train")
 # deterministic holdout provides a useful metric without leaking records across user rows
 train_df, test_df = features.randomSplit([0.8, 0.2], seed=27)
 imputed = [f"{c}_imp" for c in numeric]
 pipeline = Pipeline(stages=[Imputer(inputCols=numeric, outputCols=imputed, strategy="median"), VectorAssembler(inputCols=imputed, outputCol="raw_features"), StandardScaler(inputCol="raw_features", outputCol="features"), RandomForestClassifier(labelCol="label", featuresCol="features", numTrees=80, maxDepth=8, seed=27)])
+fit_started = perf_counter()
 model = pipeline.fit(train_df)
 metric = BinaryClassificationEvaluator(labelCol="label").evaluate(model.transform(test_df))
-print(f"Holdout areaUnderROC={metric:.5f}")
+print(f"Holdout areaUnderROC={metric:.5f}; model_fit_and_evaluation_seconds={perf_counter() - fit_started:.2f}")
 model.write().overwrite().save(f"{OUT}/models/churn-rf")
 # Small Kafka replay file, generated using the exact same feature transformations.
 scoring = features.drop("label")
-scoring.coalesce(1).write.mode("overwrite").json("file:///artifacts/scoring-events")
+scoring_dir = os.environ.get("SCORING_EXPORT_DIR", "file:///artifacts/scoring-events")
+scoring.coalesce(1).write.mode("overwrite").json(local_file(scoring_dir))
 spark.stop()
