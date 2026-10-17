@@ -11,20 +11,22 @@ TRAIN = os.environ.get("TRAIN_FILE", f"{BASE}/train_v2.csv/data/churn_comp_refre
 TX = os.environ.get("TRANSACTIONS_FILE", f"{BASE}/transactions_v2.csv/data/churn_comp_refresh/transactions_v2.csv")
 LOG = os.environ.get("LOGS_FILE", f"{BASE}/user_logs_v2.csv/data/churn_comp_refresh/user_logs_v2.csv")
 MEM = os.environ.get("MEMBERS_FILE", f"{BASE}/members_v3.csv")
+def local_file(path):
+    return path if path.startswith("file:") else f"file://{path}"
 OUT = "hdfs://namenode:9000/churn"
 
 spark = SparkSession.builder.appName("kkbox-churn-feature-train").getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
-labels = spark.read.option("header", True).csv(TRAIN).select("msno", F.col("is_churn").cast("double").alias("label")).dropDuplicates(["msno"])
-members = spark.read.option("header", True).csv(MEM).select("msno", F.col("city").cast("double"), F.col("bd").cast("double").alias("age"), F.col("registered_via").cast("double"))
-tx = spark.read.option("header", True).csv(TX)
+labels = spark.read.option("header", True).csv(local_file(TRAIN)).select("msno", F.col("is_churn").cast("double").alias("label")).dropDuplicates(["msno"])
+members = spark.read.option("header", True).csv(local_file(MEM)).select("msno", F.col("city").cast("double"), F.col("bd").cast("double").alias("age"), F.col("registered_via").cast("double"))
+tx = spark.read.option("header", True).csv(local_file(TX))
 tx_features = tx.groupBy("msno").agg(
     F.count("*").alias("tx_count"), F.avg(F.col("actual_amount_paid").cast("double")).alias("avg_paid"),
     F.avg(F.col("payment_plan_days").cast("double")).alias("avg_plan_days"),
     F.avg(F.col("is_auto_renew").cast("double")).alias("auto_renew_rate"),
     F.max(F.col("is_cancel").cast("double")).alias("ever_cancelled"),
     F.max(F.col("transaction_date").cast("int")).alias("last_transaction_date"))
-logs = spark.read.option("header", True).csv(LOG)
+logs = spark.read.option("header", True).csv(local_file(LOG))
 log_features = logs.groupBy("msno").agg(
     F.count("*").alias("log_days"), F.sum(F.col("total_secs").cast("double")).alias("total_secs"),
     F.sum(F.col("num_25").cast("double")).alias("plays_25"), F.sum(F.col("num_50").cast("double")).alias("plays_50"),
@@ -44,5 +46,5 @@ print(f"Holdout areaUnderROC={metric:.5f}")
 model.write().overwrite().save(f"{OUT}/models/churn-rf")
 # Small Kafka replay file, generated using the exact same feature transformations.
 scoring = features.drop("label")
-scoring.coalesce(1).write.mode("overwrite").json("/artifacts/scoring-events")
+scoring.coalesce(1).write.mode("overwrite").json("file:///artifacts/scoring-events")
 spark.stop()
